@@ -1,0 +1,123 @@
+name: SecureOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 1. Validación de IaC y Escaneo DevSecOps
+  security-and-lint:
+    name: Security & IaC Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Validar formato y sintaxis de Terraform
+        run: |
+          cd terraform
+          terraform init -backend=false
+          terraform fmt -check
+          terraform validate
+
+      - name: Escaneo DevSecOps con Trivy (Repositorio e IaC)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '0' # Cambiar a '1' para bloquear el pipeline si encuentra vulnerabilidades CRITICAL
+          severity: 'CRITICAL,HIGH'
+
+  # 2. Construcción y Publicación de la Imagen Docker
+  build-and-push:
+    name: Build & Push Container Image
+    needs: security-and-lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Autenticación en GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extraer metadatos para Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest
+
+      - name: Construir y publicar imagen multi-stage
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Escaneo de vulnerabilidades en la imagen final
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+
+  # 3. Despliegue Automatizado en Kubernetes
+  deploy-k8s:
+    name: Kubernetes Automated Deploy
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar acceso a Kubernetes (Kubeconfig)
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_DATA }}
+
+      - name: Actualizar manifiestos y desplegar
+        run: |
+          # Sustituir la imagen por la compilada en GHCR
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$(git rev-parse --short HEAD)"
+          sed -i "s|image: .*|image: $IMAGE_TAG|g" k8s/deployment.yaml
+
+          # Aplicar manifiestos
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/rbac.yaml
+          kubectl apply -f k8s/network-policy.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Verificar estado del despliegue (Rollout)
+        run: |
+          kubectl rollout status deployment/secure-app -n secure-apps --timeout=60s

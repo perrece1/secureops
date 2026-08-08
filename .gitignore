@@ -1,0 +1,26 @@
+# Binarios pesados
+k8s/minikube*
+minikube*
+
+# Terraform (Archivos locales y binarios descargados)
+terraform/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.tfplan
+
+# Python y cachés
+__pycache__/
+*.py[cod]
+
+# Secretos y llaves
+*.pem
+*.key
+kubeconfig
+*.kubeconfig
+.env
+
+# Configuración de IDE y SO
+.vscode/
+.idea/
+.DS_Store
